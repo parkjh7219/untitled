@@ -1,54 +1,128 @@
-import socket
-import pymysql
-import random
+import streamlit as st
+import pandas as pd
+from sqlalchemy import create_engine
+import plotly.express as px
+import time
 
-# [DB 연결 설정]
-DB_CONFIG = {
-    'host': 'atc-database.cbi6ewck0l9a.ap-northeast-2.rds.amazonaws.com',
-    'user': 'admin',
-    'password': 'miniproject123456789',
-    'db': 'ATCMAIN',
-    'charset': 'utf8mb4'
-}
+# [DB 연결] 엔진 생성
+@st.cache_resource
+def get_engine():
+    return create_engine("mysql+pymysql://admin:miniproject123456789@atc-database.cbi6ewck0l9a.ap-northeast-2.rds.amazonaws.com/ATCMAIN")
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", 9999))
-print("🚀 [ATC Receiver] 가동 중... (실시간 위협 분류 시스템 활성화)")
+engine = get_engine()
 
-while True:
+st.set_page_config(layout="wide", page_title="ATC Advanced Console")
+
+# [세션 상태] 차단 목록 및 알림 추적용
+if 'blocked_ips' not in st.session_state:
+    st.session_state['blocked_ips'] = []
+if 'last_alert_id' not in st.session_state:
+    st.session_state['last_alert_id'] = 0
+
+def get_data():
     try:
-        data, addr = sock.recvfrom(1024)
-        raw_msg = data.decode()
+        return pd.read_sql("SELECT * FROM traffic ORDER BY id DESC LIMIT 100", con=engine)
+    except:
+        return pd.DataFrame()
 
-        # 데이터를 IP와 메시지로 분리
-        v_ip, msg = raw_msg.split("|", 1) if "|" in raw_msg else (addr[0], raw_msg)
+def style_text(row):
+    colors = {'Attack': '#ff4b4b', 'Warning': '#ffa500', 'Caution': '#ffff00', 'Exploit': '#bf00ff'}
+    color = colors.get(row['status'], '#00ff00')
+    return [f'color: {color}; font-weight: bold'] * len(row)
 
-        # 메시지 키워드에 따른 위협 등급 분류
-        msg_upper = msg.upper()
-        if "ATTACK" in msg_upper:
-            status = "Attack"    # 2번: DDoS (빨강)
-        elif "WARN" in msg_upper:
-            status = "Warning"   # 3번: 포트 스캔 (주황)
-        elif "CAUTION" in msg_upper:
-            status = "Caution"   # 4번: 미승인 접근 (노랑)
-        elif "CRITICAL" in msg_upper:
-            status = "Exploit"   # 5번: 시스템 침투 (보라)
-        else:
-            status = "Normal"    # 1번: 정상 (초록)
+# ---------------------------------------------------------
+# [사이드바 메뉴]
+# ---------------------------------------------------------
+with st.sidebar:
+    st.title("🛡️ ATC 메뉴")
+    menu = st.radio(
+        "이동할 화면을 선택하세요",
+        ("📊 실시간 트래픽 요약", "📋 상세 네트워크 로그", "🚫 방화벽 설정")
+    )
+    st.divider()
+    st.write(f"🕒 시스템 가동 중: {time.strftime('%H:%M:%S')}")
 
-        # 가짜 MAC 주소 생성 (랜덤)
-        src_mac = f"00:{random.randint(10,99)}:95:9D:{random.randint(10,99)}:16"
+# ---------------------------------------------------------
+# [데이터 처리 및 알림 로직]
+# ---------------------------------------------------------
+df_raw = get_data()
 
-        # DB 저장
-        conn = pymysql.connect(**DB_CONFIG)
-        with conn.cursor() as cur:
-            sql = """INSERT INTO traffic (ip, src_mac, dst_ip, dst_mac, protocol, port, size, msg, status)
-                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-            cur.execute(sql, (v_ip, src_mac, "13.125.103.140", "00:0C:29:44:FF:01", "UDP", 9999, len(data), msg, status))
-        conn.commit()
-        conn.close()
+# 🔔 실시간 알림: 새로운 위협 패킷 탐지 시 팝업 전송
+if not df_raw.empty:
+    latest_record = df_raw.iloc[0]
+    if latest_record['id'] > st.session_state['last_alert_id']:
+        # 차단되지 않은 새로운 위험 IP만 알림
+        if latest_record['status'] != 'Normal' and latest_record['ip'] not in st.session_state['blocked_ips']:
+            st.toast(f"🚨 위협 감지: {latest_record['ip']} ({latest_record['status']})", icon="🔥")
+        st.session_state['last_alert_id'] = latest_record['id']
 
-        print(f"📡 [수신] {v_ip} -> {status} ({msg})")
+# 차단 리스트 기반 필터링
+df = df_raw.copy()
+if not df.empty and st.session_state['blocked_ips']:
+    df = df[~df['ip'].isin(st.session_state['blocked_ips'])]
 
-    except Exception as e:
-        print(f"❌ 에러 발생: {e}")
+# ---------------------------------------------------------
+# [메인 화면 내용]
+# ---------------------------------------------------------
+st.title("🛰️ ATC 사이버 보안 고급 콘솔")
+
+# 1. 요약 화면
+if menu == "📊 실시간 트래픽 요약":
+    if not df.empty:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("전체 패킷", f"{len(df)}개")
+        c2.metric("위협 탐지", f"{len(df[df['status']!='Normal'])}개")
+        c3.metric("평균 크기", f"{int(df['size'].mean())} Bytes")
+        st.divider()
+        col1, col2 = st.columns([0.6, 0.4])
+        with col1:
+            st.plotly_chart(px.line(df, x='time', y='size', title="트래픽 실시간 추이", template="plotly_dark"), use_container_width=True)
+        with col2:
+            st.plotly_chart(px.pie(df, names='status', title="위협 분포", hole=0.4, template="plotly_dark"), use_container_width=True)
+    else:
+        st.warning("📡 표시할 데이터가 없습니다.")
+
+# 2. 상세 로그 화면
+elif menu == "📋 상세 네트워크 로그":
+    if not df.empty:
+        st.subheader("🕵️ 상세 네트워크 패킷 로그")
+        styled_df = df.style.apply(style_text, axis=1)
+        st.dataframe(styled_df, use_container_width=True, height=750)
+    else:
+        st.warning("📡 표시할 데이터가 없습니다.")
+
+# 3. 방화벽 관리 화면
+elif menu == "🚫 방화벽 설정":
+    st.subheader("🛡️ 네트워크 방화벽(Firewall) 정책 관리")
+    col_in1, col_in2 = st.columns([0.7, 0.3])
+    with col_in1:
+        block_ip = st.text_input("새로운 차단 IP 주소 입력", placeholder="예: 10.10.10.10")
+    with col_in2:
+        st.write(" ")
+        st.write(" ")
+        if st.button("➕ IP 추가", use_container_width=True):
+            if block_ip and block_ip not in st.session_state['blocked_ips']:
+                st.session_state['blocked_ips'].append(block_ip)
+                st.success(f"{block_ip} 블랙리스트 등록 완료")
+                time.sleep(0.5)
+                st.rerun()
+
+    st.divider()
+    st.write("### 📝 현재 차단된 IP 목록 (개별 해제 가능)")
+    if st.session_state['blocked_ips']:
+        for i, ip in enumerate(st.session_state['blocked_ips']):
+            cl1, cl2 = st.columns([0.8, 0.2])
+            with cl1:
+                st.info(f"🚫 {ip}")
+            with cl2:
+                if st.button(f"해제", key=f"del_{ip}_{i}", use_container_width=True):
+                    st.session_state['blocked_ips'].remove(ip)
+                    st.rerun()
+    else:
+        st.info("현재 차단된 IP 주소가 없습니다.")
+
+# ---------------------------------------------------------
+# 자동 새로고침 (3초 주기로 리로드)
+# ---------------------------------------------------------
+time.sleep(3)
+st.rerun()
