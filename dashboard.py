@@ -1,42 +1,54 @@
-import streamlit as st
-import pandas as pd
-from sqlalchemy import create_engine
-import plotly.express as px
-import time
+import socket
+import pymysql
+import random
 
-# DB 연결 1
-engine = create_engine("mysql+pymysql://ATCMAIN:atc12345!@atc-main.cpwsus2yubp1.ap-northeast-2.rds.amazonaws.com/ATCMAIN")
+# [DB 연결 설정]
+DB_CONFIG = {
+    'host': 'atc-database.cbi6ewck0l9a.ap-northeast-2.rds.amazonaws.com',
+    'user': 'admin',
+    'password': 'miniproject123456789',
+    'db': 'ATCMAIN',
+    'charset': 'utf8mb4'
+}
 
-st.set_page_config(layout="wide", page_title="ATC Advanced Console")
-st.title("🛰️ ATC Cyber Security Advanced Console")
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", 9999))
+print("🚀 [ATC Receiver] 가동 중... (실시간 위협 분류 시스템 활성화)")
 
-def get_data():
+while True:
     try:
-        return pd.read_sql("SELECT * FROM traffic ORDER BY id DESC LIMIT 100", con=engine)
-    except:
-        return pd.DataFrame()
+        data, addr = sock.recvfrom(1024)
+        raw_msg = data.decode()
 
-df = get_data()
+        # 데이터를 IP와 메시지로 분리
+        v_ip, msg = raw_msg.split("|", 1) if "|" in raw_msg else (addr[0], raw_msg)
 
-if not df.empty:
-    # [1번: 요약]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("전체 패킷", f"{len(df)}개")
-    c2.metric("위협 탐지", f"{len(df[df['status']=='Attack'])}개")
-    c3.metric("평균 패킷 크기", f"{int(df['size'].mean())} Bytes")
+        # 메시지 키워드에 따른 위협 등급 분류
+        msg_upper = msg.upper()
+        if "ATTACK" in msg_upper:
+            status = "Attack"    # 2번: DDoS (빨강)
+        elif "WARN" in msg_upper:
+            status = "Warning"   # 3번: 포트 스캔 (주황)
+        elif "CAUTION" in msg_upper:
+            status = "Caution"   # 4번: 미승인 접근 (노랑)
+        elif "CRITICAL" in msg_upper:
+            status = "Exploit"   # 5번: 시스템 침투 (보라)
+        else:
+            status = "Normal"    # 1번: 정상 (초록)
 
-    # [2, 3번: 시각화]
-    col1, col2 = st.columns([0.6, 0.4])
-    with col1:
-        st.plotly_chart(px.line(df, x='time', y='size', title="실시간 트래픽 밀도", template="plotly_dark"), use_container_width=True)
-    with col2:
-        st.plotly_chart(px.pie(df, names='status', title="공격 분포", hole=0.4, template="plotly_dark"), use_container_width=True)
+        # 가짜 MAC 주소 생성 (랜덤)
+        src_mac = f"00:{random.randint(10,99)}:95:9D:{random.randint(10,99)}:16"
 
-    # [4번: 상세 로그]
-    st.subheader("📋 실시간 상세 네트워크 로그 (Packet Inspection)")
-    st.dataframe(df, use_container_width=True)
-else:
-    st.warning("📡 수신된 데이터가 없습니다. 클라이언트를 조작해 보세요.")
+        # DB 저장
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor() as cur:
+            sql = """INSERT INTO traffic (ip, src_mac, dst_ip, dst_mac, protocol, port, size, msg, status)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            cur.execute(sql, (v_ip, src_mac, "13.125.103.140", "00:0C:29:44:FF:01", "UDP", 9999, len(data), msg, status))
+        conn.commit()
+        conn.close()
 
-time.sleep(2)
-st.rerun()
+        print(f"📡 [수신] {v_ip} -> {status} ({msg})")
+
+    except Exception as e:
+        print(f"❌ 에러 발생: {e}")
